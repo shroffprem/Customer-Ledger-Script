@@ -3,17 +3,30 @@
 // What this does, in one run:
 //   1. Removes all pre-June-2026 rows from "Accounts" and "M Coll" (archiving
 //      them first into "Accounts_Archive_PreJune" / "MColl_Archive_PreJune").
-//   2. Rebuilds the "Customer Ledger" tab from scratch as a Tally-style
-//      accounting ledger: one section per customer, columns
-//      Date | Particulars | Vch Type | Vch No. | Debit | Credit | Balance,
-//      with a running balance per section and a bold double-ruled subtotal
-//      row closing each customer's section. Reference text (Debit Note /
+//      One-time historical cleanup -- not part of the recurring monthly flow.
+//   2. Every 10 minutes, rebuilds the "Customer Ledger" tab as a Tally-style
+//      accounting ledger scoped to the CURRENT month: one section per
+//      customer, columns Date | Particulars | Vch Type | Vch No. | Debit |
+//      Credit | Balance, with an Opening Balance row (carried forward from
+//      all prior history), that month's transactions, and a bold
+//      double-ruled Closing Balance row. Reference text (Debit Note /
 //      Credit Note / M-Coll note) is shown exactly as entered -- nothing
 //      here re-parses or can silently blank it.
-//   3. Installs ONE time-based trigger (every 10 minutes) so it keeps itself
-//      current automatically. No onChange trigger is used, because onChange
-//      fires on the script's own writes too and causes an endless rebuild
-//      loop - that loop is what was making the sheet flicker/glitch before.
+//   3. On the 1st of every month, monthEndRollover() automatically:
+//        a. Moves every Accounts row disbursed in the month that just ended
+//           into a new dated tab (e.g. "June 26"), in the same column
+//           layout as Accounts -- mirroring the existing "Apr/May26"
+//           follow-up pattern, but automated and named per month.
+//        b. Registers that new tab in the Config sheet's
+//           active_archive_tabs list, so the widget (Python side) picks it
+//           up automatically with no code changes.
+//        c. Freezes a permanent "Customer Ledger - <Month>" snapshot of
+//           that month's ledger (never touched again).
+//        d. Rebuilds the live "Customer Ledger" fresh for the new month.
+//   4. Installs time-based triggers (every 10 minutes for the ledger, once
+//      a month for the rollover) so both stay current automatically. No
+//      onChange trigger is used, because onChange fires on the script's own
+//      writes too and causes an endless rebuild loop.
 //
 // Setup (run once):
 //   1. Delete any old "Customer Ledger", "Accounts_Archive_PreJune",
@@ -28,13 +41,15 @@
 //   6. Reload the spreadsheet tab in your browser once it finishes.
 //
 // After that, a "Ledger Tools" menu appears in the spreadsheet itself with
-// manual options, and the ledger refreshes on its own every 10 minutes.
+// manual options, the ledger refreshes on its own every 10 minutes, and the
+// monthly rollover runs itself automatically on the 1st of each month.
 
 var ACCOUNTS_SHEET = "Accounts";
 var MCOLL_SHEET = "M Coll";
 var LEDGER_SHEET = "Customer Ledger";
 var ACC_ARCHIVE_SHEET = "Accounts_Archive_PreJune";
 var MC_ARCHIVE_SHEET = "MColl_Archive_PreJune";
+var CONFIG_SHEET = "Config";
 var CUTOFF = new Date(2026, 5, 1); // June 1, 2026
 
 function toDate_(v) {
@@ -56,6 +71,50 @@ function getOrCreateArchive_(ss, name, headerRow) {
     sheet.getRange(1, 1, 1, headerRow.length).setFontWeight("bold");
   }
   return sheet;
+}
+
+// ── Config sheet helpers (same key/value row format the Python widget uses) ──
+
+function getConfigValue_(key) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var cfgSheet = ss.getSheetByName(CONFIG_SHEET);
+  if (!cfgSheet) return null;
+  var vals = cfgSheet.getDataRange().getValues();
+  for (var i = 0; i < vals.length; i++) {
+    if (vals[i][0] === key) {
+      var raw = vals[i][1];
+      try {
+        return JSON.parse(raw);
+      } catch (e) {
+        return raw;
+      }
+    }
+  }
+  return null;
+}
+
+function setConfigValue_(key, value) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var cfgSheet = ss.getSheetByName(CONFIG_SHEET);
+  if (!cfgSheet) {
+    cfgSheet = ss.insertSheet(CONFIG_SHEET);
+    cfgSheet.appendRow(["key", "value"]);
+  }
+  var serialized = (typeof value === "object") ? JSON.stringify(value) : String(value);
+  var vals = cfgSheet.getDataRange().getValues();
+  for (var i = 0; i < vals.length; i++) {
+    if (vals[i][0] === key) {
+      cfgSheet.getRange(i + 1, 2).setValue(serialized);
+      return;
+    }
+  }
+  cfgSheet.appendRow([key, serialized]);
+}
+
+function getArchiveTabNames_() {
+  var tabs = getConfigValue_('active_archive_tabs');
+  if (!tabs || !tabs.length) return ['Apr/May26'];
+  return tabs;
 }
 
 function removePreJuneData() {
@@ -113,233 +172,398 @@ function removePreJuneData() {
   return { accRemoved: accRemovedRows.length, mcRemoved: mcRemovedRows.length };
 }
 
-function rebuildLedger() {
-  var lock = LockService.getScriptLock();
-  var gotLock = lock.tryLock(10000);
-  if (!gotLock) return; // another run is already in progress, skip this one
+// ── Ledger data model: build once, write to any sheet (live or frozen snapshot) ──
 
-  try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var accSheet = ss.getSheetByName(ACCOUNTS_SHEET);
-    var mcSheet = ss.getSheetByName(MCOLL_SHEET);
-    if (!accSheet || !mcSheet) {
-      throw new Error("Could not find Accounts or M Coll tabs.");
-    }
+// Reads Accounts (live, current month) + every registered archive tab, and
+// builds one flat event list per customer (Disbursement/Charges/GST/Collection),
+// then splits each customer's history into an Opening Balance (everything
+// before periodStart) and the transactions that fall inside
+// [periodStart, periodEndExclusive) -- periodEndExclusive of null means "no
+// upper bound" (used for the live, current-month ledger).
+function buildLedgerData_(periodStart, periodEndExclusive) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var accSheet = ss.getSheetByName(ACCOUNTS_SHEET);
+  var mcSheet = ss.getSheetByName(MCOLL_SHEET);
+  if (!accSheet || !mcSheet) {
+    throw new Error("Could not find Accounts or M Coll tabs.");
+  }
 
-    var accData = accSheet.getDataRange().getValues();
-    var accRows = accData.slice(2).filter(function (r) { return r[0]; });
+  var accData = accSheet.getDataRange().getValues();
+  var accRows = accData.slice(2).filter(function (r) { return r[0]; });
 
-    var mcData = mcSheet.getDataRange().getValues();
-    var mcRows = mcData.slice(1).filter(function (r) { return r[0]; });
+  getArchiveTabNames_().forEach(function (tabName) {
+    var tab = ss.getSheetByName(tabName);
+    if (!tab) return;
+    var tabData = tab.getDataRange().getValues();
+    // Tabs created by monthEndRollover have the same 2-header-row layout as
+    // Accounts; the legacy Apr/May26 tab has no header row at all -- detect
+    // which by checking whether row 0 already looks like a data row.
+    var startIdx = (tabData[0] && String(tabData[0][0]).indexOf('BLP-') === 0) ? 0 : 2;
+    accRows = accRows.concat(tabData.slice(startIdx).filter(function (r) { return r[0]; }));
+  });
 
-    var mcByDisb = {};
-    mcRows.forEach(function (r) {
-      var disbId = r[0];
-      if (!mcByDisb[disbId]) mcByDisb[disbId] = [];
-      mcByDisb[disbId].push({ date: r[1], amount: r[2], note: r[3] });
+  var mcData = mcSheet.getDataRange().getValues();
+  var mcRows = mcData.slice(1).filter(function (r) { return r[0]; });
+
+  var mcByDisb = {};
+  mcRows.forEach(function (r) {
+    var disbId = r[0];
+    if (!mcByDisb[disbId]) mcByDisb[disbId] = [];
+    mcByDisb[disbId].push({ date: r[1], amount: r[2], note: r[3] });
+  });
+
+  // One flat list of ledger events (Debit = disbursement/charges/GST,
+  // Credit = collection), grouped by customer. Reference text (Debit Note /
+  // Credit Note / M-Coll note) flows straight through unparsed -- there is
+  // no regex here that can silently blank it.
+  var eventsByCustomer = {};
+
+  accRows.forEach(function (r) {
+    var disbId = r[0], disbDate = r[1];
+    var customer = (r[2] || '').toString().trim() || '(No Name)';
+    var amount = r[7], charges = r[8], gst = r[9];
+    var collDate = r[11], collAmt = r[12];
+    var debitNote = r[21], creditNote = r[22];
+
+    if (!eventsByCustomer[customer]) eventsByCustomer[customer] = [];
+
+    eventsByCustomer[customer].push({
+      date: disbDate,
+      bold: "Disbursed to " + customer,
+      note: debitNote ? String(debitNote) : "",
+      vchType: "Disbursement",
+      vchNo: disbId,
+      debit: Number(amount) || 0,
+      credit: 0
     });
 
-    // One flat list of ledger events (Debit = disbursement, Credit = collection),
-    // grouped by customer so they can become per-customer sections below.
-    // Reference text (Debit Note / Credit Note / M-Coll note) flows straight
-    // through unparsed -- there is no regex here that can silently blank it.
-    var eventsByCustomer = {};
-
-    accRows.forEach(function (r) {
-      var disbId = r[0], disbDate = r[1];
-      var customer = (r[2] || '').toString().trim() || '(No Name)';
-      var amount = r[7], charges = r[8], gst = r[9];
-      var collDate = r[11], collAmt = r[12];
-      var debitNote = r[21], creditNote = r[22];
-
-      if (!eventsByCustomer[customer]) eventsByCustomer[customer] = [];
-
+    // Charges and GST are owed by the customer too (Total Payable =
+    // Amount + Charges + GST) -- shown as their own debit rows rather
+    // than folded into the disbursement figure, so each is independently
+    // traceable in the running balance.
+    if (Number(charges) > 0) {
       eventsByCustomer[customer].push({
         date: disbDate,
-        bold: "Disbursed to " + customer,
-        note: debitNote ? String(debitNote) : "",
-        vchType: "Disbursement",
+        bold: "Processing Charges",
+        note: "",
+        vchType: "Charges",
         vchNo: disbId,
-        debit: Number(amount) || 0,
+        debit: Number(charges) || 0,
         credit: 0
       });
+    }
+    if (Number(gst) > 0) {
+      eventsByCustomer[customer].push({
+        date: disbDate,
+        bold: "GST on Charges",
+        note: "",
+        vchType: "GST",
+        vchNo: disbId,
+        debit: Number(gst) || 0,
+        credit: 0
+      });
+    }
 
-      // Charges and GST are owed by the customer too (Total Payable =
-      // Amount + Charges + GST) -- shown as their own debit rows rather
-      // than folded into the disbursement figure, so each is independently
-      // traceable in the running balance.
-      if (Number(charges) > 0) {
-        eventsByCustomer[customer].push({
-          date: disbDate,
-          bold: "Processing Charges",
-          note: "",
-          vchType: "Charges",
-          vchNo: disbId,
-          debit: Number(charges) || 0,
-          credit: 0
-        });
-      }
-      if (Number(gst) > 0) {
-        eventsByCustomer[customer].push({
-          date: disbDate,
-          bold: "GST on Charges",
-          note: "",
-          vchType: "GST",
-          vchNo: disbId,
-          debit: Number(gst) || 0,
-          credit: 0
-        });
-      }
+    var colls = [];
+    if (mcByDisb[disbId] && mcByDisb[disbId].length > 0) {
+      mcByDisb[disbId].forEach(function (c) {
+        colls.push({ date: c.date, amount: c.amount, note: c.note });
+      });
+    } else if (collAmt) {
+      colls.push({ date: collDate, amount: collAmt, note: creditNote });
+    }
 
-      var colls = [];
-      if (mcByDisb[disbId] && mcByDisb[disbId].length > 0) {
-        mcByDisb[disbId].forEach(function (c) {
-          colls.push({ date: c.date, amount: c.amount, note: c.note });
-        });
-      } else if (collAmt) {
-        colls.push({ date: collDate, amount: collAmt, note: creditNote });
-      }
-
-      colls.forEach(function (c) {
-        eventsByCustomer[customer].push({
-          date: c.date,
-          bold: "Collection received",
-          note: c.note ? String(c.note) : "",
-          vchType: "Collection",
-          vchNo: disbId,
-          debit: 0,
-          credit: Number(c.amount) || 0
-        });
+    colls.forEach(function (c) {
+      eventsByCustomer[customer].push({
+        date: c.date,
+        bold: "Collection received",
+        note: c.note ? String(c.note) : "",
+        vchType: "Collection",
+        vchNo: disbId,
+        debit: 0,
+        credit: Number(c.amount) || 0
       });
     });
+  });
 
-    // Order customer sections chronologically by each customer's earliest
-    // transaction date (not alphabetically by name).
-    var customerNames = Object.keys(eventsByCustomer).sort(function (a, b) {
-      var da = eventsByCustomer[a].reduce(function (min, ev) {
-        var d = toDate_(ev.date);
-        return (d && (!min || d < min)) ? d : min;
-      }, null);
-      var db = eventsByCustomer[b].reduce(function (min, ev) {
-        var d = toDate_(ev.date);
-        return (d && (!min || d < min)) ? d : min;
-      }, null);
+  // Order customer sections chronologically by each customer's earliest
+  // transaction date (not alphabetically by name).
+  var customerNames = Object.keys(eventsByCustomer).sort(function (a, b) {
+    var da = eventsByCustomer[a].reduce(function (min, ev) {
+      var d = toDate_(ev.date);
+      return (d && (!min || d < min)) ? d : min;
+    }, null);
+    var db = eventsByCustomer[b].reduce(function (min, ev) {
+      var d = toDate_(ev.date);
+      return (d && (!min || d < min)) ? d : min;
+    }, null);
+    if (!da && !db) return 0;
+    if (!da) return 1;
+    if (!db) return -1;
+    return da - db;
+  });
+
+  var headers = ["Date", "Particulars", "Vch Type", "Vch No.", "Debit", "Credit", "Balance"];
+  var out = [headers];
+  var sectionHeaderRows = [];    // customer-name rows -> bold + merged
+  var openingRows = [];          // Opening Balance rows -> bold only
+  var sectionTotalRows = [];     // Closing Balance rows -> bold + top border
+  var particularsRichText = [];  // {row, boldLen, hasNote} for bold/italic split
+
+  customerNames.forEach(function (custName) {
+    var events = eventsByCustomer[custName].slice();
+    events.sort(function (a, b) {
+      var da = toDate_(a.date), db = toDate_(b.date);
       if (!da && !db) return 0;
       if (!da) return 1;
       if (!db) return -1;
       return da - db;
     });
 
-    var headers = ["Date", "Particulars", "Vch Type", "Vch No.", "Debit", "Credit", "Balance"];
-    var out = [headers];
-    var sectionHeaderRows = [];    // customer-name rows -> bold + merged
-    var sectionTotalRows = [];     // subtotal rows -> bold + top border
-    var particularsRichText = [];  // {row, boldLen, hasNote} for bold/italic split
-
-    customerNames.forEach(function (custName) {
-      var events = eventsByCustomer[custName].slice();
-      events.sort(function (a, b) {
-        var da = toDate_(a.date), db = toDate_(b.date);
-        if (!da && !db) return 0;
-        if (!da) return 1;
-        if (!db) return -1;
-        return da - db;
-      });
-
-      sectionHeaderRows.push(out.length);
-      out.push([custName, "", "", "", "", "", ""]);
-
-      var runDebit = 0, runCredit = 0;
-      events.forEach(function (ev) {
-        runDebit += ev.debit;
-        runCredit += ev.credit;
-        var bal = runDebit - runCredit;
-        if (Math.abs(bal) < 1) bal = 0; // sub-rupee residue rounds to settled
-
-        var rowIdx = out.length;
-        var particulars = ev.note ? (ev.bold + "\n" + ev.note) : ev.bold;
-        out.push([
-          ev.date, particulars, ev.vchType, ev.vchNo,
-          ev.debit || "", ev.credit || "", bal
-        ]);
-        particularsRichText.push({ row: rowIdx, boldLen: ev.bold.length, hasNote: !!ev.note });
-      });
-
-      var closingBal = runDebit - runCredit;
-      if (Math.abs(closingBal) < 1) closingBal = 0;
-
-      sectionTotalRows.push(out.length);
-      out.push(["", "Total", "", "", runDebit, runCredit, closingBal]);
-      out.push(["", "", "", "", "", "", ""]); // spacer row between customer sections
+    // Split into "before period" (rolls into one Opening Balance figure)
+    // and "in period" (shown as individual transaction rows). Anything on
+    // or after periodEndExclusive is outside a frozen snapshot's month and
+    // is dropped entirely (periodEndExclusive is null for the live ledger,
+    // so nothing is ever dropped there).
+    var openingDebit = 0, openingCredit = 0;
+    var periodEvents = [];
+    events.forEach(function (ev) {
+      var d = toDate_(ev.date);
+      var beforePeriod = d && periodStart && d < periodStart;
+      var afterPeriod = d && periodEndExclusive && d >= periodEndExclusive;
+      if (beforePeriod) {
+        openingDebit += ev.debit;
+        openingCredit += ev.credit;
+      } else if (!afterPeriod) {
+        periodEvents.push(ev);
+      }
     });
 
-    var ledgerSheet = ss.getSheetByName(LEDGER_SHEET);
-    if (!ledgerSheet) {
-      ledgerSheet = ss.insertSheet(LEDGER_SHEET);
-    } else {
-      ledgerSheet.clear();
-      ledgerSheet.clearFormats();
-      ledgerSheet.getBandings().forEach(function (b) { b.remove(); });
-      ledgerSheet.clearConditionalFormatRules();
+    var openingBal = openingDebit - openingCredit;
+    if (Math.abs(openingBal) < 1) openingBal = 0;
+
+    // Nothing to show for this customer in this period at all
+    if (openingDebit === 0 && openingCredit === 0 && periodEvents.length === 0) return;
+
+    sectionHeaderRows.push(out.length);
+    out.push([custName, "", "", "", "", "", ""]);
+
+    var runDebit = openingDebit, runCredit = openingCredit;
+
+    if (openingDebit !== 0 || openingCredit !== 0) {
+      var openRowIdx = out.length;
+      out.push(["", "Opening Balance", "", "", "", "", openingBal]);
+      openingRows.push(openRowIdx);
+      particularsRichText.push({ row: openRowIdx, boldLen: "Opening Balance".length, hasNote: false });
     }
 
-    var numRows = out.length;
-    var numCols = headers.length;
-    ledgerSheet.getRange(1, 1, numRows, numCols).setValues(out);
+    periodEvents.forEach(function (ev) {
+      runDebit += ev.debit;
+      runCredit += ev.credit;
+      var bal = runDebit - runCredit;
+      if (Math.abs(bal) < 1) bal = 0; // sub-rupee residue rounds to settled
 
-    ledgerSheet.getRange(1, 1, 1, numCols).setFontWeight("bold");
-    ledgerSheet.setFrozenRows(1);
-
-    sectionHeaderRows.forEach(function (r) {
-      var rng = ledgerSheet.getRange(r + 1, 1, 1, numCols);
-      rng.merge();
-      rng.setFontWeight("bold").setFontSize(11).setHorizontalAlignment("left");
+      var rowIdx = out.length;
+      var particulars = ev.note ? (ev.bold + "\n" + ev.note) : ev.bold;
+      out.push([
+        ev.date, particulars, ev.vchType, ev.vchNo,
+        ev.debit || "", ev.credit || "", bal
+      ]);
+      particularsRichText.push({ row: rowIdx, boldLen: ev.bold.length, hasNote: !!ev.note });
     });
 
-    sectionTotalRows.forEach(function (r) {
-      ledgerSheet.getRange(r + 1, 1, 1, numCols).setFontWeight("bold");
-      ledgerSheet.getRange(r + 1, 1, 1, numCols)
-        .setBorder(true, null, null, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
-    });
+    var closingBal = runDebit - runCredit;
+    if (Math.abs(closingBal) < 1) closingBal = 0;
 
-    var particularsCol = 2;
-    ledgerSheet.getRange(2, particularsCol, numRows - 1, 1)
-      .setWrap(true).setHorizontalAlignment("left").setVerticalAlignment("top");
+    sectionTotalRows.push(out.length);
+    out.push(["", "Closing Balance", "", "", runDebit, runCredit, closingBal]);
+    out.push(["", "", "", "", "", "", ""]); // spacer row between customer sections
+  });
 
-    particularsRichText.forEach(function (info) {
-      var cell = ledgerSheet.getRange(info.row + 1, particularsCol);
-      var text = cell.getValue();
-      if (!text) return;
-      var builder = SpreadsheetApp.newRichTextValue().setText(text);
-      builder.setTextStyle(0, info.boldLen, SpreadsheetApp.newTextStyle().setBold(true).build());
-      if (info.hasNote) {
-        builder.setTextStyle(info.boldLen + 1, text.length,
-          SpreadsheetApp.newTextStyle().setItalic(true).setBold(false).build());
+  return {
+    headers: headers,
+    out: out,
+    sectionHeaderRows: sectionHeaderRows,
+    openingRows: openingRows,
+    sectionTotalRows: sectionTotalRows,
+    particularsRichText: particularsRichText
+  };
+}
+
+// Writes a buildLedgerData_() result into the given sheet name (creating it
+// if needed), with all the Tally-style formatting. Shared by the live
+// ledger rebuild and the frozen monthly snapshot.
+function writeLedgerToSheet_(sheetName, data) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var ledgerSheet = ss.getSheetByName(sheetName);
+  if (!ledgerSheet) {
+    ledgerSheet = ss.insertSheet(sheetName);
+  } else {
+    ledgerSheet.clear();
+    ledgerSheet.clearFormats();
+    ledgerSheet.getBandings().forEach(function (b) { b.remove(); });
+    ledgerSheet.clearConditionalFormatRules();
+  }
+
+  var out = data.out;
+  var numRows = out.length;
+  var numCols = data.headers.length;
+  ledgerSheet.getRange(1, 1, numRows, numCols).setValues(out);
+
+  ledgerSheet.getRange(1, 1, 1, numCols).setFontWeight("bold");
+  ledgerSheet.setFrozenRows(1);
+
+  data.sectionHeaderRows.forEach(function (r) {
+    var rng = ledgerSheet.getRange(r + 1, 1, 1, numCols);
+    rng.merge();
+    rng.setFontWeight("bold").setFontSize(11).setHorizontalAlignment("left");
+  });
+
+  data.openingRows.forEach(function (r) {
+    ledgerSheet.getRange(r + 1, 1, 1, numCols).setFontWeight("bold");
+  });
+
+  data.sectionTotalRows.forEach(function (r) {
+    ledgerSheet.getRange(r + 1, 1, 1, numCols).setFontWeight("bold");
+    ledgerSheet.getRange(r + 1, 1, 1, numCols)
+      .setBorder(true, null, null, null, null, null, "black", SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+  });
+
+  var particularsCol = 2;
+  ledgerSheet.getRange(2, particularsCol, numRows - 1, 1)
+    .setWrap(true).setHorizontalAlignment("left").setVerticalAlignment("top");
+
+  data.particularsRichText.forEach(function (info) {
+    var cell = ledgerSheet.getRange(info.row + 1, particularsCol);
+    var text = cell.getValue();
+    if (!text) return;
+    var builder = SpreadsheetApp.newRichTextValue().setText(text);
+    builder.setTextStyle(0, info.boldLen, SpreadsheetApp.newTextStyle().setBold(true).build());
+    if (info.hasNote) {
+      builder.setTextStyle(info.boldLen + 1, text.length,
+        SpreadsheetApp.newTextStyle().setItalic(true).setBold(false).build());
+    }
+    cell.setRichTextValue(builder.build());
+  });
+
+  ledgerSheet.getRange(2, 1, numRows - 1, 1).setNumberFormat("d-mmm-yy");
+
+  var moneyCols = [5, 6, 7]; // Debit, Credit, Balance
+  moneyCols.forEach(function (c) {
+    ledgerSheet.getRange(2, c, numRows - 1, 1)
+      .setNumberFormat("#,##0.00;(#,##0.00)")
+      .setHorizontalAlignment("right");
+  });
+
+  ledgerSheet.getRange(1, 1, numRows, numCols)
+    .setBorder(true, true, true, true, true, true, "#cccccc", SpreadsheetApp.BorderStyle.SOLID);
+
+  // Narrow column widths so the whole ledger fits on screen without
+  // horizontal scrolling.
+  ledgerSheet.setColumnWidth(1, 90);   // Date
+  ledgerSheet.setColumnWidth(2, 320);  // Particulars (wide, wraps to 2 lines)
+  ledgerSheet.setColumnWidth(3, 100);  // Vch Type
+  ledgerSheet.setColumnWidth(4, 120);  // Vch No.
+  ledgerSheet.setColumnWidth(5, 100);  // Debit
+  ledgerSheet.setColumnWidth(6, 100);  // Credit
+  ledgerSheet.setColumnWidth(7, 100);  // Balance
+}
+
+// Rebuilds the live "Customer Ledger" tab, scoped to the current calendar
+// month (everything before the 1st of this month becomes one Opening
+// Balance figure per customer).
+function rebuildLedger_impl_() {
+  var now = new Date();
+  var periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  var data = buildLedgerData_(periodStart, null);
+  writeLedgerToSheet_(LEDGER_SHEET, data);
+}
+
+function rebuildLedger() {
+  var lock = LockService.getScriptLock();
+  var gotLock = lock.tryLock(10000);
+  if (!gotLock) return; // another run is already in progress, skip this one
+  try {
+    rebuildLedger_impl_();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ── Monthly rollover ──────────────────────────────────────────────────────
+
+// Runs automatically on the 1st of every month (see setupTriggers_). Moves
+// the month that just ended out of Accounts into a dated archive tab,
+// registers it for the widget to keep reading, freezes that month's ledger
+// as a permanent snapshot, then rebuilds the live ledger fresh for the new
+// month.
+function monthEndRollover() {
+  var lock = LockService.getScriptLock();
+  var gotLock = lock.tryLock(30000);
+  if (!gotLock) return;
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var accSheet = ss.getSheetByName(ACCOUNTS_SHEET);
+    if (!accSheet) {
+      throw new Error("Could not find Accounts tab.");
+    }
+
+    var now = new Date();
+    var lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    var monthLabel = Utilities.formatDate(lastMonthDate, Session.getScriptTimeZone(), "MMMM yy"); // e.g. "June 26"
+
+    var accData = accSheet.getDataRange().getValues();
+    var headerRow1 = accData[0]; // title row
+    var headerRow2 = accData[1]; // actual column headers
+
+    var moveRows = [];
+    var moveRowNums = [];
+
+    for (var i = 2; i < accData.length; i++) {
+      var row = accData[i];
+      if (!row[0]) continue;
+      var disbDate = toDate_(row[1]);
+      if (disbDate && disbDate.getFullYear() === lastMonthDate.getFullYear() &&
+          disbDate.getMonth() === lastMonthDate.getMonth()) {
+        moveRows.push(row);
+        moveRowNums.push(i + 1);
       }
-      cell.setRichTextValue(builder.build());
-    });
+    }
 
-    ledgerSheet.getRange(2, 1, numRows - 1, 1).setNumberFormat("d-mmm-yy");
+    if (moveRows.length === 0) {
+      Logger.log("monthEndRollover: no Accounts rows found for " + monthLabel + " -- nothing to archive.");
+    } else {
+      var archiveSheet = ss.getSheetByName(monthLabel);
+      if (!archiveSheet) archiveSheet = ss.insertSheet(monthLabel);
+      archiveSheet.getRange(1, 1, 1, headerRow1.length).setValues([headerRow1]);
+      archiveSheet.getRange(2, 1, 1, headerRow2.length).setValues([headerRow2]);
+      archiveSheet.getRange(1, 1, 2, headerRow1.length).setFontWeight("bold");
+      archiveSheet.getRange(3, 1, moveRows.length, moveRows[0].length).setValues(moveRows);
 
-    var moneyCols = [5, 6, 7]; // Debit, Credit, Balance
-    moneyCols.forEach(function (c) {
-      ledgerSheet.getRange(2, c, numRows - 1, 1)
-        .setNumberFormat("#,##0.00;(#,##0.00)")
-        .setHorizontalAlignment("right");
-    });
+      // Remove the moved rows from Accounts, highest row number first so
+      // earlier deletions don't shift the indices of rows still to delete.
+      moveRowNums.sort(function (a, b) { return b - a; }).forEach(function (r) { accSheet.deleteRow(r); });
 
-    ledgerSheet.getRange(1, 1, numRows, numCols)
-      .setBorder(true, true, true, true, true, true, "#cccccc", SpreadsheetApp.BorderStyle.SOLID);
+      var tabs = getArchiveTabNames_();
+      if (tabs.indexOf(monthLabel) === -1) {
+        tabs.push(monthLabel);
+        setConfigValue_('active_archive_tabs', tabs);
+      }
 
-    // Narrow column widths so the whole ledger fits on screen without
-    // horizontal scrolling (the old 14-column layout needed it; this doesn't).
-    ledgerSheet.setColumnWidth(1, 90);   // Date
-    ledgerSheet.setColumnWidth(2, 320);  // Particulars (wide, wraps to 2 lines)
-    ledgerSheet.setColumnWidth(3, 100);  // Vch Type
-    ledgerSheet.setColumnWidth(4, 120);  // Vch No.
-    ledgerSheet.setColumnWidth(5, 100);  // Debit
-    ledgerSheet.setColumnWidth(6, 100);  // Credit
-    ledgerSheet.setColumnWidth(7, 100);  // Balance
+      Logger.log("monthEndRollover: archived " + moveRows.length + " row(s) into '" + monthLabel + "'.");
+    }
+
+    // Freeze a permanent snapshot of the month that just ended, then
+    // rebuild the live ledger fresh for the new (now-current) month.
+    var periodStart = lastMonthDate;
+    var periodEndExclusive = new Date(now.getFullYear(), now.getMonth(), 1);
+    var snapshotData = buildLedgerData_(periodStart, periodEndExclusive);
+    writeLedgerToSheet_("Customer Ledger - " + monthLabel, snapshotData);
+
+    rebuildLedger_impl_();
+
+    Logger.log("monthEndRollover: snapshot frozen for '" + monthLabel + "', live ledger rebuilt for the new month.");
   } finally {
     lock.releaseLock();
   }
@@ -351,6 +575,11 @@ function setupTriggers_() {
     .timeBased()
     .everyMinutes(10)
     .create();
+  ScriptApp.newTrigger("monthEndRollover")
+    .timeBased()
+    .onMonthDay(1)
+    .atHour(1)
+    .create();
 }
 
 // Run this once after deleting old sheets/triggers.
@@ -361,7 +590,8 @@ function freshSetup() {
   SpreadsheetApp.getUi().alert(
     "Setup complete. Removed " + result.accRemoved + " pre-June disbursement row(s) and " +
     result.mcRemoved + " pre-June M Coll row(s). Customer Ledger rebuilt as a Tally-style " +
-    "per-customer ledger. It will auto-refresh every 10 minutes from now on."
+    "per-customer ledger, scoped to the current month. It will auto-refresh every 10 minutes, " +
+    "and the monthly rollover (archive + frozen snapshot) will run itself on the 1st of each month."
   );
 }
 
@@ -370,6 +600,7 @@ function onOpen() {
     .createMenu("Ledger Tools")
     .addItem("Run Fresh Setup (remove pre-June + rebuild)", "freshSetup")
     .addItem("Rebuild Ledger Now", "rebuildLedger")
+    .addItem("Run Month-End Rollover Now", "monthEndRollover")
     .addItem("Remove Pre-June Data Only", "removePreJuneData")
     .addToUi();
 }
