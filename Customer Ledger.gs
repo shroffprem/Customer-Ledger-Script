@@ -62,12 +62,33 @@ var LEDGER_CUTOFF_DATE = new Date(2026, 4, 1); // May 1, 2026 -- March/April are
   // permanently done; nothing dated before this ever enters the Customer
   // Ledger again, regardless of open/closed status.
 
+var MONTH_NAMES_ = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11
+};
+
 function toDate_(v) {
   if (v instanceof Date) return v;
   if (!v) return null;
   var s = String(v).trim();
-  var m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})/);
+
+  // DD-MM-YYYY / DD/MM/YYYY (all-numeric)
+  var m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
   if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+
+  // DD-MMM-YYYY or DD-MMM-YY (month name, e.g. "21-Jun-2026" or "21-Jun-26")
+  // -- NOT handed to the native Date() parser, which is unreliable for this
+  // exact format and was silently producing wrong dates.
+  m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})$/);
+  if (m) {
+    var mon = MONTH_NAMES_[m[2].toLowerCase()];
+    if (mon !== undefined) {
+      var yr = Number(m[3]);
+      if (yr < 100) yr += 2000;
+      return new Date(yr, mon, Number(m[1]));
+    }
+  }
+
   var d = new Date(s);
   if (isNaN(d.getTime())) return null;
   return d;
