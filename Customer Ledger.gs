@@ -5,13 +5,16 @@
 //      them first into "Accounts_Archive_PreJune" / "MColl_Archive_PreJune").
 //      One-time historical cleanup -- not part of the recurring monthly flow.
 //   2. Every 10 minutes, rebuilds the "Customer Ledger" tab as a Tally-style
-//      accounting ledger: one section per customer, columns Date |
-//      Particulars | Vch Type | Vch No. | Debit | Credit | Balance, each
-//      showing a case's FULL chronological history with a true running
-//      balance ending in a bold double-ruled Closing Balance row. A case is
-//      included if it has any activity this month, OR it's still open
-//      (regardless of how many earlier months back it was disbursed) --
-//      closed cases with no current-month activity drop out entirely.
+//      accounting ledger: one section per CASE (Disbursement ID), columns
+//      Date | Particulars | Vch Type | Vch No. | Debit | Credit | Balance,
+//      each showing that case's FULL chronological history with a true
+//      running balance ending in a bold double-ruled Closing Balance row.
+//      A customer with multiple loans gets one separate section per loan
+//      (labeled "Name — Disbursement ID") -- never merged into one
+//      combined balance. A case is included if it has any activity this
+//      month, OR it's still open (regardless of how many earlier months
+//      back it was disbursed) -- closed cases with no current-month
+//      activity drop out entirely.
 //      Anything disbursed before LEDGER_CUTOFF_DATE (March/April) is
 //      excluded permanently, no matter its status. Reference text (Debit
 //      Note / Credit Note / M-Coll note) is shown exactly as entered --
@@ -241,10 +244,14 @@ function buildLedgerData_() {
   });
 
   // One flat list of ledger events (Debit = disbursement/charges/GST,
-  // Credit = collection), grouped by customer. Reference text (Debit Note /
-  // Credit Note / M-Coll note) flows straight through unparsed -- there is
-  // no regex here that can silently blank it.
-  var eventsByCustomer = {};
+  // Credit = collection), grouped by CASE (Disbursement ID), not by
+  // customer -- the same person taking multiple loans gets one separate
+  // section per loan, each with its own running balance, never merged
+  // together. Reference text (Debit Note / Credit Note / M-Coll note)
+  // flows straight through unparsed -- there is no regex here that can
+  // silently blank it.
+  var eventsByCase = {};
+  var caseLabels = {}; // disbId -> "Customer Name — BLP-XXX" section header text
 
   accRows.forEach(function (r) {
     var disbId = r[0], disbDate = r[1];
@@ -329,18 +336,19 @@ function buildLedgerData_() {
     var stillOpen = status !== 'CLOSED';
     if (!hasActivityThisMonth && !stillOpen) return;
 
-    if (!eventsByCustomer[customer]) eventsByCustomer[customer] = [];
-    eventsByCustomer[customer] = eventsByCustomer[customer].concat(caseEvents);
+    eventsByCase[disbId] = caseEvents;
+    caseLabels[disbId] = customer + " — " + disbId;
   });
 
-  // Order customer sections chronologically by each customer's earliest
-  // transaction date (not alphabetically by name).
-  var customerNames = Object.keys(eventsByCustomer).sort(function (a, b) {
-    var da = eventsByCustomer[a].reduce(function (min, ev) {
+  // Order sections chronologically by each case's earliest transaction date
+  // (not alphabetically by name) -- each Disbursement ID is its own
+  // section, even when the same customer has multiple loans.
+  var caseIds = Object.keys(eventsByCase).sort(function (a, b) {
+    var da = eventsByCase[a].reduce(function (min, ev) {
       var d = toDate_(ev.date);
       return (d && (!min || d < min)) ? d : min;
     }, null);
-    var db = eventsByCustomer[b].reduce(function (min, ev) {
+    var db = eventsByCase[b].reduce(function (min, ev) {
       var d = toDate_(ev.date);
       return (d && (!min || d < min)) ? d : min;
     }, null);
@@ -356,8 +364,8 @@ function buildLedgerData_() {
   var sectionTotalRows = [];     // Closing Balance rows -> bold + top border
   var particularsRichText = [];  // {row, boldLen, hasNote} for bold/italic split
 
-  customerNames.forEach(function (custName) {
-    var events = eventsByCustomer[custName].slice();
+  caseIds.forEach(function (disbId) {
+    var events = eventsByCase[disbId].slice();
     events.sort(function (a, b) {
       var da = toDate_(a.date), db = toDate_(b.date);
       if (!da && !db) return 0;
@@ -367,7 +375,7 @@ function buildLedgerData_() {
     });
 
     sectionHeaderRows.push(out.length);
-    out.push([custName, "", "", "", "", "", ""]);
+    out.push([caseLabels[disbId], "", "", "", "", "", ""]);
 
     var runDebit = 0, runCredit = 0;
     events.forEach(function (ev) {
@@ -390,7 +398,7 @@ function buildLedgerData_() {
 
     sectionTotalRows.push(out.length);
     out.push(["", "Closing Balance", "", "", runDebit, runCredit, closingBal]);
-    out.push(["", "", "", "", "", "", ""]); // spacer row between customer sections
+    out.push(["", "", "", "", "", "", ""]); // spacer row between case sections
   });
 
   return {
