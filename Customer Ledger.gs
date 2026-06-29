@@ -305,13 +305,28 @@ function buildLedgerData_() {
       });
     }
 
+    // M Coll's instalments can understate the truth -- e.g. a final top-up
+    // payment recorded directly in Accounts' own Collected Amount column
+    // but never logged as a separate M Coll row. Never let the M-Coll sum
+    // fall short of what Accounts itself shows; add the gap as one more
+    // collection event so the case can actually reach its real balance.
     var colls = [];
+    var mcSum = 0;
     if (mcByDisb[disbId] && mcByDisb[disbId].length > 0) {
       mcByDisb[disbId].forEach(function (c) {
         colls.push({ date: c.date, amount: c.amount, note: c.note });
+        mcSum += parseNum_(c.amount);
       });
-    } else if (collAmt) {
-      colls.push({ date: collDate, amount: collAmt, note: creditNote });
+    }
+    var accountsCollAmt = parseNum_(collAmt);
+    if (colls.length === 0 && accountsCollAmt > 0) {
+      colls.push({ date: collDate, amount: accountsCollAmt, note: creditNote });
+    } else if (accountsCollAmt > mcSum + 0.5) {
+      colls.push({
+        date: collDate,
+        amount: accountsCollAmt - mcSum,
+        note: creditNote || '(Additional collection recorded in Accounts, not logged in M Coll)'
+      });
     }
 
     colls.forEach(function (c) {
