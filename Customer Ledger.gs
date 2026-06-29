@@ -322,10 +322,18 @@ function buildLedgerData_() {
     if (colls.length === 0 && accountsCollAmt > 0) {
       colls.push({ date: collDate, amount: accountsCollAmt, note: creditNote });
     } else if (accountsCollAmt > mcSum + 0.5) {
+      // Credit Note often accumulates every ref ever recorded for this case
+      // (comma-joined), so pull out only the piece(s) NOT already shown via
+      // an M Coll row -- otherwise the gap event duplicates a ref that's
+      // already visible above it.
+      var existingNotes = colls.map(function (c) { return c.note || ''; }).join(' | ');
+      var newRefParts = String(creditNote || '').split(',')
+        .map(function (p) { return p.trim(); })
+        .filter(function (p) { return p && existingNotes.indexOf(p) === -1; });
       colls.push({
         date: collDate,
         amount: accountsCollAmt - mcSum,
-        note: creditNote || '(Additional collection recorded in Accounts, not logged in M Coll)'
+        note: newRefParts.join(', ') || '(Additional collection recorded in Accounts, not logged in M Coll)'
       });
     }
 
