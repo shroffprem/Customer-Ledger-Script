@@ -5,13 +5,17 @@
 //      them first into "Accounts_Archive_PreJune" / "MColl_Archive_PreJune").
 //      One-time historical cleanup -- not part of the recurring monthly flow.
 //   2. Every 10 minutes, rebuilds the "Customer Ledger" tab as a Tally-style
-//      accounting ledger scoped to the CURRENT month: one section per
-//      customer, columns Date | Particulars | Vch Type | Vch No. | Debit |
-//      Credit | Balance, with an Opening Balance row (carried forward from
-//      all prior history), that month's transactions, and a bold
-//      double-ruled Closing Balance row. Reference text (Debit Note /
-//      Credit Note / M-Coll note) is shown exactly as entered -- nothing
-//      here re-parses or can silently blank it.
+//      accounting ledger: one section per customer, columns Date |
+//      Particulars | Vch Type | Vch No. | Debit | Credit | Balance, each
+//      showing a case's FULL chronological history with a true running
+//      balance ending in a bold double-ruled Closing Balance row. A case is
+//      included if it has any activity this month, OR it's still open
+//      (regardless of how many earlier months back it was disbursed) --
+//      closed cases with no current-month activity drop out entirely.
+//      Anything disbursed before LEDGER_CUTOFF_DATE (March/April) is
+//      excluded permanently, no matter its status. Reference text (Debit
+//      Note / Credit Note / M-Coll note) is shown exactly as entered --
+//      nothing here re-parses or can silently blank it.
 //   3. On the 1st of every month, monthEndRollover() automatically:
 //        a. Moves every Accounts row disbursed in the month that just ended
 //           into a new dated tab (e.g. "June 26"), in the same column
@@ -20,9 +24,9 @@
 //        b. Registers that new tab in the Config sheet's
 //           active_archive_tabs list, so the widget (Python side) picks it
 //           up automatically with no code changes.
-//        c. Freezes a permanent "Customer Ledger - <Month>" snapshot of
-//           that month's ledger (never touched again).
-//        d. Rebuilds the live "Customer Ledger" fresh for the new month.
+//        c. Rebuilds the live "Customer Ledger" so it reflects the new
+//           month immediately (no separate frozen snapshot needed -- the
+//           inclusion rule above always reflects the correct picture).
 //   4. Installs time-based triggers (every 10 minutes for the ledger, once
 //      a month for the rollover) so both stay current automatically. No
 //      onChange trigger is used, because onChange fires on the script's own
@@ -175,21 +179,31 @@ function removePreJuneData() {
   return { accRemoved: accRemovedRows.length, mcRemoved: mcRemovedRows.length };
 }
 
-// ── Ledger data model: build once, write to any sheet (live or frozen snapshot) ──
+// ── Ledger data model ─────────────────────────────────────────────────────
 
 // Reads Accounts (live, current month) + every registered archive tab, and
-// builds one flat event list per customer (Disbursement/Charges/GST/Collection),
-// then splits each customer's history into an Opening Balance (everything
-// before periodStart) and the transactions that fall inside
-// [periodStart, periodEndExclusive) -- periodEndExclusive of null means "no
-// upper bound" (used for the live, current-month ledger).
-function buildLedgerData_(periodStart, periodEndExclusive) {
+// builds one flat, FULL chronological event list per customer (Disbursement
+// /Charges/GST/Collection) -- no Opening Balance abstraction, no period
+// splitting. A case is included in full (every event it has, ever) if
+// either:
+//   (a) it has at least one event (disbursement or collection) dated in the
+//       current calendar month, or
+//   (b) it is still open (Overdue Status != Closed), regardless of how many
+//       months back it was disbursed.
+// Closed cases with no current-month activity are dropped entirely. Anything
+// disbursed before LEDGER_CUTOFF_DATE (March/April) is excluded no matter
+// what -- permanently retired.
+function buildLedgerData_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var accSheet = ss.getSheetByName(ACCOUNTS_SHEET);
   var mcSheet = ss.getSheetByName(MCOLL_SHEET);
   if (!accSheet || !mcSheet) {
     throw new Error("Could not find Accounts or M Coll tabs.");
   }
+
+  var now = new Date();
+  var monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+  var monthEndExclusive = new Date(now.getFullYear(), now.getMonth() + 1, 1);
 
   var accData = accSheet.getDataRange().getValues();
   var accRows = accData.slice(2).filter(function (r) { return r[0]; });
@@ -226,19 +240,17 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
     var disbDateParsed = toDate_(disbDate);
     // March/April are permanently retired -- never enter the ledger again.
     if (disbDateParsed && disbDateParsed < LEDGER_CUTOFF_DATE) return;
-    // Closed cases are dropped entirely (not even an Opening Balance
-    // contribution) -- only still-open cases get carried forward.
-    var status = (r[18] || '').toString().trim();
-    if (status.toUpperCase() === 'CLOSED') return;
 
+    var status = (r[18] || '').toString().trim().toUpperCase();
     var customer = (r[2] || '').toString().trim() || '(No Name)';
     var amount = r[7], charges = r[8], gst = r[9];
     var collDate = r[11], collAmt = r[12];
     var debitNote = r[21], creditNote = r[22];
 
-    if (!eventsByCustomer[customer]) eventsByCustomer[customer] = [];
-
-    eventsByCustomer[customer].push({
+    // Build this case's full event list first, then decide whether to
+    // include it at all.
+    var caseEvents = [];
+    caseEvents.push({
       date: disbDate,
       bold: "Disbursed to " + customer,
       note: debitNote ? String(debitNote) : "",
@@ -253,7 +265,7 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
     // than folded into the disbursement figure, so each is independently
     // traceable in the running balance.
     if (Number(charges) > 0) {
-      eventsByCustomer[customer].push({
+      caseEvents.push({
         date: disbDate,
         bold: "Processing Charges",
         note: "",
@@ -264,7 +276,7 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
       });
     }
     if (Number(gst) > 0) {
-      eventsByCustomer[customer].push({
+      caseEvents.push({
         date: disbDate,
         bold: "GST on Charges",
         note: "",
@@ -285,7 +297,7 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
     }
 
     colls.forEach(function (c) {
-      eventsByCustomer[customer].push({
+      caseEvents.push({
         date: c.date,
         bold: "Collection received",
         note: c.note ? String(c.note) : "",
@@ -295,6 +307,19 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
         credit: Number(c.amount) || 0
       });
     });
+
+    // Inclusion rule: this case appears (with its FULL history) if it has
+    // any activity this month, OR it's still open -- regardless of which
+    // earlier month (after the cutoff) it originated in.
+    var hasActivityThisMonth = caseEvents.some(function (ev) {
+      var d = toDate_(ev.date);
+      return d && d >= monthStart && d < monthEndExclusive;
+    });
+    var stillOpen = status !== 'CLOSED';
+    if (!hasActivityThisMonth && !stillOpen) return;
+
+    if (!eventsByCustomer[customer]) eventsByCustomer[customer] = [];
+    eventsByCustomer[customer] = eventsByCustomer[customer].concat(caseEvents);
   });
 
   // Order customer sections chronologically by each customer's earliest
@@ -317,7 +342,6 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
   var headers = ["Date", "Particulars", "Vch Type", "Vch No.", "Debit", "Credit", "Balance"];
   var out = [headers];
   var sectionHeaderRows = [];    // customer-name rows -> bold + merged
-  var openingRows = [];          // Opening Balance rows -> bold only
   var sectionTotalRows = [];     // Closing Balance rows -> bold + top border
   var particularsRichText = [];  // {row, boldLen, hasNote} for bold/italic split
 
@@ -331,44 +355,11 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
       return da - db;
     });
 
-    // Split into "before period" (rolls into one Opening Balance figure)
-    // and "in period" (shown as individual transaction rows). Anything on
-    // or after periodEndExclusive is outside a frozen snapshot's month and
-    // is dropped entirely (periodEndExclusive is null for the live ledger,
-    // so nothing is ever dropped there).
-    var openingDebit = 0, openingCredit = 0;
-    var periodEvents = [];
-    events.forEach(function (ev) {
-      var d = toDate_(ev.date);
-      var beforePeriod = d && periodStart && d < periodStart;
-      var afterPeriod = d && periodEndExclusive && d >= periodEndExclusive;
-      if (beforePeriod) {
-        openingDebit += ev.debit;
-        openingCredit += ev.credit;
-      } else if (!afterPeriod) {
-        periodEvents.push(ev);
-      }
-    });
-
-    var openingBal = openingDebit - openingCredit;
-    if (Math.abs(openingBal) < 1) openingBal = 0;
-
-    // Nothing to show for this customer in this period at all
-    if (openingDebit === 0 && openingCredit === 0 && periodEvents.length === 0) return;
-
     sectionHeaderRows.push(out.length);
     out.push([custName, "", "", "", "", "", ""]);
 
-    var runDebit = openingDebit, runCredit = openingCredit;
-
-    if (openingDebit !== 0 || openingCredit !== 0) {
-      var openRowIdx = out.length;
-      out.push(["", "Opening Balance", "", "", "", "", openingBal]);
-      openingRows.push(openRowIdx);
-      particularsRichText.push({ row: openRowIdx, boldLen: "Opening Balance".length, hasNote: false });
-    }
-
-    periodEvents.forEach(function (ev) {
+    var runDebit = 0, runCredit = 0;
+    events.forEach(function (ev) {
       runDebit += ev.debit;
       runCredit += ev.credit;
       var bal = runDebit - runCredit;
@@ -395,15 +386,13 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
     headers: headers,
     out: out,
     sectionHeaderRows: sectionHeaderRows,
-    openingRows: openingRows,
     sectionTotalRows: sectionTotalRows,
     particularsRichText: particularsRichText
   };
 }
 
 // Writes a buildLedgerData_() result into the given sheet name (creating it
-// if needed), with all the Tally-style formatting. Shared by the live
-// ledger rebuild and the frozen monthly snapshot.
+// if needed), with all the Tally-style formatting.
 function writeLedgerToSheet_(sheetName, data) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var ledgerSheet = ss.getSheetByName(sheetName);
@@ -428,10 +417,6 @@ function writeLedgerToSheet_(sheetName, data) {
     var rng = ledgerSheet.getRange(r + 1, 1, 1, numCols);
     rng.merge();
     rng.setFontWeight("bold").setFontSize(11).setHorizontalAlignment("left");
-  });
-
-  data.openingRows.forEach(function (r) {
-    ledgerSheet.getRange(r + 1, 1, 1, numCols).setFontWeight("bold");
   });
 
   data.sectionTotalRows.forEach(function (r) {
@@ -480,13 +465,11 @@ function writeLedgerToSheet_(sheetName, data) {
   ledgerSheet.setColumnWidth(7, 100);  // Balance
 }
 
-// Rebuilds the live "Customer Ledger" tab, scoped to the current calendar
-// month (everything before the 1st of this month becomes one Opening
-// Balance figure per customer).
+// Rebuilds the live "Customer Ledger" tab: every case with activity this
+// month, plus every still-open case from any earlier month after the
+// cutoff -- each shown with its full history (see buildLedgerData_).
 function rebuildLedger_impl_() {
-  var now = new Date();
-  var periodStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  var data = buildLedgerData_(periodStart, null);
+  var data = buildLedgerData_();
   writeLedgerToSheet_(LEDGER_SHEET, data);
 }
 
@@ -565,16 +548,13 @@ function monthEndRollover() {
       Logger.log("monthEndRollover: archived " + moveRows.length + " row(s) into '" + monthLabel + "'.");
     }
 
-    // Freeze a permanent snapshot of the month that just ended, then
-    // rebuild the live ledger fresh for the new (now-current) month.
-    var periodStart = lastMonthDate;
-    var periodEndExclusive = new Date(now.getFullYear(), now.getMonth(), 1);
-    var snapshotData = buildLedgerData_(periodStart, periodEndExclusive);
-    writeLedgerToSheet_("Customer Ledger - " + monthLabel, snapshotData);
-
+    // Refresh the live ledger now that Accounts has shifted to the new
+    // month (no separate frozen snapshot -- the live ledger's own
+    // current-month-or-still-open inclusion rule always reflects the
+    // correct picture, so there's nothing extra to freeze).
     rebuildLedger_impl_();
 
-    Logger.log("monthEndRollover: snapshot frozen for '" + monthLabel + "', live ledger rebuilt for the new month.");
+    Logger.log("monthEndRollover: rollover complete for '" + monthLabel + "', live ledger rebuilt.");
   } finally {
     lock.releaseLock();
   }
@@ -601,8 +581,8 @@ function freshSetup() {
   SpreadsheetApp.getUi().alert(
     "Setup complete. Removed " + result.accRemoved + " pre-June disbursement row(s) and " +
     result.mcRemoved + " pre-June M Coll row(s). Customer Ledger rebuilt as a Tally-style " +
-    "per-customer ledger, scoped to the current month. It will auto-refresh every 10 minutes, " +
-    "and the monthly rollover (archive + frozen snapshot) will run itself on the 1st of each month."
+    "per-customer ledger (this month's activity + all still-open cases). It will auto-refresh " +
+    "every 10 minutes, and the monthly Accounts archival will run itself on the 1st of each month."
   );
 }
 
