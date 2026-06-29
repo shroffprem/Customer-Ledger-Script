@@ -70,6 +70,17 @@ function toDate_(v) {
   return d;
 }
 
+// Some Amount/Collected Amount cells are stored as genuine numbers, others
+// as text with Indian thousands separators (e.g. "13,51,000.00") -- plain
+// Number() returns NaN on the comma-text ones, silently zeroing them out.
+// Strip commas first so both forms parse correctly.
+function parseNum_(v) {
+  if (v === null || v === undefined || v === '') return 0;
+  if (typeof v === 'number') return v;
+  var n = Number(String(v).replace(/,/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+
 function getOrCreateArchive_(ss, name, headerRow) {
   var sheet = ss.getSheetByName(name);
   if (!sheet) {
@@ -256,7 +267,7 @@ function buildLedgerData_() {
       note: debitNote ? String(debitNote) : "",
       vchType: "Disbursement",
       vchNo: disbId,
-      debit: Number(amount) || 0,
+      debit: parseNum_(amount),
       credit: 0
     });
 
@@ -264,25 +275,25 @@ function buildLedgerData_() {
     // Amount + Charges + GST) -- shown as their own debit rows rather
     // than folded into the disbursement figure, so each is independently
     // traceable in the running balance.
-    if (Number(charges) > 0) {
+    if (parseNum_(charges) > 0) {
       caseEvents.push({
         date: disbDate,
         bold: "Processing Charges",
         note: "",
         vchType: "Charges",
         vchNo: disbId,
-        debit: Number(charges) || 0,
+        debit: parseNum_(charges),
         credit: 0
       });
     }
-    if (Number(gst) > 0) {
+    if (parseNum_(gst) > 0) {
       caseEvents.push({
         date: disbDate,
         bold: "GST on Charges",
         note: "",
         vchType: "GST",
         vchNo: disbId,
-        debit: Number(gst) || 0,
+        debit: parseNum_(gst),
         credit: 0
       });
     }
@@ -304,7 +315,7 @@ function buildLedgerData_() {
         vchType: "Collection",
         vchNo: disbId,
         debit: 0,
-        credit: Number(c.amount) || 0
+        credit: parseNum_(c.amount)
       });
     });
 
