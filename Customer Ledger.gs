@@ -51,6 +51,9 @@ var ACC_ARCHIVE_SHEET = "Accounts_Archive_PreJune";
 var MC_ARCHIVE_SHEET = "MColl_Archive_PreJune";
 var CONFIG_SHEET = "Config";
 var CUTOFF = new Date(2026, 5, 1); // June 1, 2026
+var LEDGER_CUTOFF_DATE = new Date(2026, 4, 1); // May 1, 2026 -- March/April are
+  // permanently done; nothing dated before this ever enters the Customer
+  // Ledger again, regardless of open/closed status.
 
 function toDate_(v) {
   if (v instanceof Date) return v;
@@ -220,6 +223,14 @@ function buildLedgerData_(periodStart, periodEndExclusive) {
 
   accRows.forEach(function (r) {
     var disbId = r[0], disbDate = r[1];
+    var disbDateParsed = toDate_(disbDate);
+    // March/April are permanently retired -- never enter the ledger again.
+    if (disbDateParsed && disbDateParsed < LEDGER_CUTOFF_DATE) return;
+    // Closed cases are dropped entirely (not even an Opening Balance
+    // contribution) -- only still-open cases get carried forward.
+    var status = (r[18] || '').toString().trim();
+    if (status.toUpperCase() === 'CLOSED') return;
+
     var customer = (r[2] || '').toString().trim() || '(No Name)';
     var amount = r[7], charges = r[8], gst = r[9];
     var collDate = r[11], collAmt = r[12];
