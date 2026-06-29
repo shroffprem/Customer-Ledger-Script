@@ -488,9 +488,8 @@ function rebuildLedger() {
 
 // Runs automatically on the 1st of every month (see setupTriggers_). Moves
 // the month that just ended out of Accounts into a dated archive tab,
-// registers it for the widget to keep reading, freezes that month's ledger
-// as a permanent snapshot, then rebuilds the live ledger fresh for the new
-// month.
+// registers it for the widget to keep reading, then rebuilds the live
+// ledger so it immediately reflects the new month.
 function monthEndRollover() {
   var lock = LockService.getScriptLock();
   var gotLock = lock.tryLock(30000);
