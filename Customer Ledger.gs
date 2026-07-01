@@ -680,6 +680,7 @@ function onOpen() {
     .addItem("Run Fresh Setup (remove pre-June + rebuild)", "freshSetup")
     .addItem("Rebuild Ledger Now", "rebuildLedger")
     .addItem("Run Month-End Rollover Now", "monthEndRollover")
+    .addItem("Setup / Reset Triggers", "setupTriggers_")
     .addItem("Remove Pre-June Data Only", "removePreJuneData")
     .addToUi();
 }
