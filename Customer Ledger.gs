@@ -677,12 +677,113 @@ function freshSetup() {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu("Ledger Tools")
+    .addItem("Open Navigator", "openNavigator")
+    .addSeparator()
     .addItem("Run Fresh Setup (remove pre-June + rebuild)", "freshSetup")
     .addItem("Rebuild Ledger Now", "rebuildLedger")
     .addItem("Run Month-End Rollover Now", "monthEndRollover")
     .addItem("Setup / Reset Triggers", "setupTriggers_")
     .addItem("Remove Pre-June Data Only", "removePreJuneData")
     .addToUi();
+}
+
+// ── Tab Navigator Sidebar ─────────────────────────────────────────────────────
+
+// Groups all tabs into 5 categories and shows a clickable sidebar.
+// Monthly Archives and Ledger Snapshots are auto-detected by name pattern so
+// new months appear automatically after each rollover without any code change.
+function openNavigator() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var allSheets = ss.getSheets().map(function(s) { return s.getName(); });
+
+  var LIVE    = ['Accounts', 'Customer Ledger', 'M Coll'];
+  var REPORTS = ['DashBoard', 'Claude_Dashboard', 'Reports', 'Partner Ledger',
+                 'Charges Ledger', 'Capital Log', 'Cluster P&L', 'TAT Trend',
+                 'GST Register', 'Ageing Report', 'Reconciliation', 'Recon Log'];
+  var SYSTEM  = ['Contact', 'Form Links', 'Email Collector', 'Config',
+                 'MColl_Archive_PreJune', 'Accounts_Archive_PreJune', 'March 26'];
+
+  var fixedNames = LIVE.concat(REPORTS).concat(SYSTEM);
+
+  var archives  = [];
+  var snapshots = [];
+  var others    = [];
+
+  allSheets.forEach(function(name) {
+    if (fixedNames.indexOf(name) !== -1) return;
+    if (/^Ledger [A-Za-z]{3} \d{2}$/.test(name)) {
+      snapshots.push(name);                            // "Ledger Jun 26"
+    } else if (/^[A-Za-z]{3,5}\/[A-Za-z]{3,5}\d{2}$/.test(name) ||
+               /^[A-Za-z]{3} \d{2}$/.test(name)) {
+      archives.push(name);                             // "Jun 26" or "Apr/May26"
+    } else {
+      others.push(name);
+    }
+  });
+  archives.sort().reverse();
+  snapshots.sort().reverse();
+
+  var groups = [
+    { emoji: '🟢', label: 'Live',
+      tabs: LIVE.filter(function(n) { return allSheets.indexOf(n) !== -1; }) },
+    { emoji: '📁', label: 'Monthly Archives', tabs: archives },
+    { emoji: '📒', label: 'Ledger Snapshots', tabs: snapshots },
+    { emoji: '📊', label: 'Reports',
+      tabs: REPORTS.filter(function(n) { return allSheets.indexOf(n) !== -1; }) },
+    { emoji: '⚙️', label: 'System',
+      tabs: SYSTEM.filter(function(n) { return allSheets.indexOf(n) !== -1; }).concat(others) },
+  ];
+
+  var sidebar = HtmlService.createHtmlOutput(buildNavigatorHtml_(groups))
+    .setTitle('Navigator')
+    .setWidth(220);
+  SpreadsheetApp.getUi().showSidebar(sidebar);
+}
+
+function buildNavigatorHtml_(groups) {
+  var css = '<style>' +
+    'body{font-family:Arial,sans-serif;font-size:12px;margin:0;padding:8px;background:#f8f9fa;}' +
+    'h3{font-size:11px;font-weight:bold;color:#2c3e70;margin:10px 0 3px;padding:4px 6px;' +
+    'background:#e8ecf4;border-radius:3px;cursor:pointer;user-select:none;}' +
+    'h3:first-child{margin-top:0;}' +
+    '.grp{margin-bottom:2px;}' +
+    '.tab-btn{display:block;width:100%;text-align:left;padding:5px 8px;margin:1px 0;' +
+    'border:none;background:transparent;cursor:pointer;border-radius:3px;' +
+    'font-size:12px;color:#1a1a2e;box-sizing:border-box;}' +
+    '.tab-btn:hover{background:#dce4f5;color:#2c3e70;}' +
+    '.empty{color:#aaa;font-size:11px;padding:3px 8px;font-style:italic;}' +
+    '</style>';
+  var script = '<script>' +
+    'function go(n){google.script.run.activateSheet(n);}' +
+    'function tog(id){var e=document.getElementById(id);' +
+    'e.style.display=e.style.display==="none"?"":"none";}' +
+    '</script>';
+
+  var body = '';
+  groups.forEach(function(g, i) {
+    var id = 'g' + i;
+    body += '<div class="grp">';
+    body += '<h3 onclick="tog(\'' + id + '\')">' + g.emoji + ' ' + g.label + '</h3>';
+    body += '<div id="' + id + '">';
+    if (!g.tabs || g.tabs.length === 0) {
+      body += '<div class="empty">None</div>';
+    } else {
+      g.tabs.forEach(function(name) {
+        var safe = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+        body += '<button class="tab-btn" onclick="go(\'' + safe + '\')">' +
+                name.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</button>';
+      });
+    }
+    body += '</div></div>';
+  });
+
+  return '<!DOCTYPE html><html><head><meta charset="utf-8">' + css + script +
+         '</head><body>' + body + '</body></html>';
+}
+
+function activateSheet(name) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(name);
+  if (sheet) sheet.activate();
 }
 // Web App endpoint - lets the widget trigger an instant ledger rebuild.
 //
