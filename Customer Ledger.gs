@@ -20,16 +20,18 @@
 //      Note / Credit Note / M-Coll note) is shown exactly as entered --
 //      nothing here re-parses or can silently blank it.
 //   3. On the 1st of every month, monthEndRollover() automatically:
-//        a. Moves every Accounts row disbursed in the month that just ended
-//           into a new dated tab (e.g. "June 26"), in the same column
+//        a. Snapshots the Customer Ledger for the month that just ended
+//           into a frozen tab (e.g. "Ledger Jun 26") -- a permanent record
+//           of exactly what was owed and collected that month.
+//        b. Moves every Accounts row disbursed in the month that just ended
+//           into a new dated tab (e.g. "Jun 26"), in the same column
 //           layout as Accounts -- mirroring the existing "Apr/May26"
 //           follow-up pattern, but automated and named per month.
-//        b. Registers that new tab in the Config sheet's
+//        c. Registers that new tab in the Config sheet's
 //           active_archive_tabs list, so the widget (Python side) picks it
 //           up automatically with no code changes.
-//        c. Rebuilds the live "Customer Ledger" so it reflects the new
-//           month immediately (no separate frozen snapshot needed -- the
-//           inclusion rule above always reflects the correct picture).
+//        d. Rebuilds the live "Customer Ledger" so it reflects the new
+//           month immediately (open cases roll forward, closed ones drop).
 //   4. Installs time-based triggers (every 10 minutes for the ledger, once
 //      a month for the rollover) so both stay current automatically. No
 //      onChange trigger is used, because onChange fires on the script's own
@@ -222,13 +224,17 @@ function removePreJuneData() {
 // splitting. A case is included in full (every event it has, ever) if
 // either:
 //   (a) it has at least one event (disbursement or collection) dated in the
-//       current calendar month, or
+//       target calendar month, or
 //   (b) it is still open (Overdue Status != Closed), regardless of how many
 //       months back it was disbursed.
-// Closed cases with no current-month activity are dropped entirely. Anything
+// Closed cases with no target-month activity are dropped entirely. Anything
 // disbursed before LEDGER_CUTOFF_DATE (March/April) is excluded no matter
 // what -- permanently retired.
-function buildLedgerData_() {
+//
+// asOfDate (optional): if provided, "this month" means the month of that
+// date instead of the current month. Used by monthEndRollover() to snapshot
+// the closing ledger for the month that just ended.
+function buildLedgerData_(asOfDate) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var accSheet = ss.getSheetByName(ACCOUNTS_SHEET);
   var mcSheet = ss.getSheetByName(MCOLL_SHEET);
@@ -236,9 +242,9 @@ function buildLedgerData_() {
     throw new Error("Could not find Accounts or M Coll tabs.");
   }
 
-  var now = new Date();
-  var monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-  var monthEndExclusive = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  var ref = asOfDate || new Date();
+  var monthStart = new Date(ref.getFullYear(), ref.getMonth(), 1);
+  var monthEndExclusive = new Date(ref.getFullYear(), ref.getMonth() + 1, 1);
 
   var accData = accSheet.getDataRange().getValues();
   var accRows = accData.slice(2).filter(function (r) { return r[0]; });
@@ -371,8 +377,8 @@ function buildLedgerData_() {
     });
 
     // Inclusion rule: this case appears (with its FULL history) if it has
-    // any activity this month, OR it's still open -- regardless of which
-    // earlier month (after the cutoff) it originated in.
+    // any activity in the target month, OR it's still open -- regardless
+    // of which earlier month (after the cutoff) it originated in.
     var hasActivityThisMonth = caseEvents.some(function (ev) {
       var d = toDate_(ev.date);
       return d && d >= monthStart && d < monthEndExclusive;
@@ -549,10 +555,11 @@ function rebuildLedger() {
 
 // ── Monthly rollover ──────────────────────────────────────────────────────
 
-// Runs automatically on the 1st of every month (see setupTriggers_). Moves
-// the month that just ended out of Accounts into a dated archive tab,
-// registers it for the widget to keep reading, then rebuilds the live
-// ledger so it immediately reflects the new month.
+// Runs automatically on the 1st of every month (see setupTriggers_). Steps:
+//   1. Snapshot the Customer Ledger for last month → "Ledger Jun 26" (frozen archive).
+//   2. Move Accounts rows for last month → "Jun 26" archive tab.
+//   3. Register the new archive tab in Config so the widget picks it up.
+//   4. Rebuild the live Customer Ledger for the new month.
 function monthEndRollover() {
   var lock = LockService.getScriptLock();
   var gotLock = lock.tryLock(30000);
@@ -567,8 +574,25 @@ function monthEndRollover() {
 
     var now = new Date();
     var lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-    var monthLabel = Utilities.formatDate(lastMonthDate, Session.getScriptTimeZone(), "MMMM yy"); // e.g. "June 26"
+    var tz = Session.getScriptTimeZone();
+    // e.g. "Jun 26" (short month + 2-digit year) -- matches existing tab
+    // naming convention used for Apr/May26 and the manually-created Jun 26.
+    var monthLabel = Utilities.formatDate(lastMonthDate, tz, "MMM yy");       // "Jun 26"
+    var ledgerLabel = "Ledger " + monthLabel;                                   // "Ledger Jun 26"
 
+    // ── Step 1: Freeze a Customer Ledger snapshot for last month ─────────
+    // Build the ledger as it stood for last month (asOfDate = any day in
+    // last month, so monthStart/monthEndExclusive bracket last month).
+    var ledgerSnapshotName = ss.getSheetByName(ledgerLabel) ? null : ledgerLabel;
+    if (ledgerSnapshotName) {
+      var snapshotData = buildLedgerData_(lastMonthDate);
+      writeLedgerToSheet_(ledgerSnapshotName, snapshotData);
+      Logger.log("monthEndRollover: created ledger snapshot '" + ledgerSnapshotName + "'.");
+    } else {
+      Logger.log("monthEndRollover: ledger snapshot '" + ledgerLabel + "' already exists, skipping.");
+    }
+
+    // ── Step 2: Archive Accounts rows for last month ──────────────────────
     var accData = accSheet.getDataRange().getValues();
     var headerRow1 = accData[0]; // title row
     var headerRow2 = accData[1]; // actual column headers
@@ -591,16 +615,20 @@ function monthEndRollover() {
       Logger.log("monthEndRollover: no Accounts rows found for " + monthLabel + " -- nothing to archive.");
     } else {
       var archiveSheet = ss.getSheetByName(monthLabel);
-      if (!archiveSheet) archiveSheet = ss.insertSheet(monthLabel);
-      archiveSheet.getRange(1, 1, 1, headerRow1.length).setValues([headerRow1]);
-      archiveSheet.getRange(2, 1, 1, headerRow2.length).setValues([headerRow2]);
-      archiveSheet.getRange(1, 1, 2, headerRow1.length).setFontWeight("bold");
-      archiveSheet.getRange(3, 1, moveRows.length, moveRows[0].length).setValues(moveRows);
+      if (!archiveSheet) {
+        archiveSheet = ss.insertSheet(monthLabel);
+        archiveSheet.getRange(1, 1, 1, headerRow1.length).setValues([headerRow1]);
+        archiveSheet.getRange(2, 1, 1, headerRow2.length).setValues([headerRow2]);
+        archiveSheet.getRange(1, 1, 2, headerRow1.length).setFontWeight("bold");
+      }
+      archiveSheet.getRange(archiveSheet.getLastRow() + 1, 1, moveRows.length, moveRows[0].length)
+        .setValues(moveRows);
 
       // Remove the moved rows from Accounts, highest row number first so
       // earlier deletions don't shift the indices of rows still to delete.
       moveRowNums.sort(function (a, b) { return b - a; }).forEach(function (r) { accSheet.deleteRow(r); });
 
+      // ── Step 3: Register the new archive tab in Config ─────────────────
       var tabs = getArchiveTabNames_();
       if (tabs.indexOf(monthLabel) === -1) {
         tabs.push(monthLabel);
@@ -610,10 +638,7 @@ function monthEndRollover() {
       Logger.log("monthEndRollover: archived " + moveRows.length + " row(s) into '" + monthLabel + "'.");
     }
 
-    // Refresh the live ledger now that Accounts has shifted to the new
-    // month (no separate frozen snapshot -- the live ledger's own
-    // current-month-or-still-open inclusion rule always reflects the
-    // correct picture, so there's nothing extra to freeze).
+    // ── Step 4: Rebuild the live Customer Ledger for the new month ────────
     rebuildLedger_impl_();
 
     Logger.log("monthEndRollover: rollover complete for '" + monthLabel + "', live ledger rebuilt.");
@@ -644,7 +669,8 @@ function freshSetup() {
     "Setup complete. Removed " + result.accRemoved + " pre-June disbursement row(s) and " +
     result.mcRemoved + " pre-June M Coll row(s). Customer Ledger rebuilt as a Tally-style " +
     "per-customer ledger (this month's activity + all still-open cases). It will auto-refresh " +
-    "every 10 minutes, and the monthly Accounts archival will run itself on the 1st of each month."
+    "every 10 minutes, and the monthly rollover (Accounts archive + Ledger snapshot) will run " +
+    "itself on the 1st of each month."
   );
 }
 
