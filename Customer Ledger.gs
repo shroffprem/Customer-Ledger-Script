@@ -685,7 +685,6 @@ function onOpen() {
     .addItem("Setup / Reset Triggers", "setupTriggers_")
     .addItem("Remove Pre-June Data Only", "removePreJuneData")
     .addToUi();
-  openNavigator();
 }
 
 // ── Tab Navigator Sidebar ─────────────────────────────────────────────────────
